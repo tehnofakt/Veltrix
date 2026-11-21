@@ -21,6 +21,7 @@ from aiogram.types import (
     BusinessBotRights,
     BusinessConnection,
     BusinessMessagesDeleted,
+    CallbackQuery,
     Chat,
     Message,
     PhotoSize,
@@ -96,6 +97,13 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
         if tasks:
             await asyncio.wait_for(asyncio.gather(*tasks), 1)
 
+    async def finish_jobs(self):
+        for _ in range(5):
+            tasks = list(self.app.media_tasks.values()) + list(self.app.mute_tasks.values())
+            if not tasks:
+                return
+            await asyncio.wait_for(asyncio.gather(*tasks), 2)
+
     def second_owner(self):
         self.archive.start_user(3, 3)
         self.archive.save_connection(connection(3, "c3"))
@@ -104,9 +112,10 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
         await self.app.private(private("/start", owner=4))
         self.assertTrue(self.archive.user(4)["active"])
         text = "".join(call.args[1] for call in self.bot.send_message.await_args_list)
-        self.assertIn("Чат-боты", text)
-        self.assertIn("сохраняться на сервере", text)
-        self.assertIn("коды входа", text)
+        self.assertIn("Подключение", text)
+        self.assertIn("сохраняются на сервере", text)
+        await self.app.private(private("/connect", owner=4))
+        self.assertIn("коды входа", self.bot.send_message.await_args.args[1])
 
     async def test_no_archive_without_start_or_while_paused(self):
         self.archive.save_connection(connection(4, "c4"))
@@ -224,6 +233,7 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(row["suppressed"])
         self.bot.delete_business_messages.side_effect = delete
         await self.app.business_message(message("saved"))
+        await self.finish_jobs()
         await self.app.deleted(deletion())
         self.assertTrue(self.archive.get(1, 2, 10)["deleted"])
         self.assertEqual(len(self.pending()), 0)
@@ -233,10 +243,11 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
         self.bot.delete_business_messages.side_effect = TelegramBadRequest(
             method=SendMessage(chat_id=1, text="test"), message="forbidden")
         await self.app.business_message(message())
+        await self.finish_jobs()
         self.assertFalse(self.archive.get(1, 2, 10)["suppressed"])
         self.bot.delete_business_messages.side_effect = network_error()
-        with self.assertRaises(TelegramNetworkError):
-            await self.app.business_message(message(mid=11))
+        await self.app.business_message(message(mid=11))
+        await self.finish_jobs()
         self.assertTrue(self.archive.get(1, 2, 11)["suppressed"])
 
     async def test_lost_delete_right_keeps_archive_without_delete(self):
@@ -280,6 +291,8 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.archive.get(1, 2, 10)["deleted"])
         self.assertTrue(all(row["owner_id"] == 3 for row in self.pending()))
         await self.app.private(private("/archive"))
+        key = self.archive.known_chat(1, 2)["key"]
+        await self.app.show_conversation(1, key)
         text = "".join(call.args[1] for call in self.bot.send_message.await_args_list)
         self.assertIn("one secret", text)
         self.assertNotIn("three secret", text)
@@ -293,6 +306,7 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
             Path(destination).write_bytes(b"synthetic test photo")
         self.bot.download_file.side_effect = download
         await self.app.business_message(message("caption", photo=True))
+        await self.finish_jobs()
         row = self.archive.get(1, 2, 10)
         self.assertTrue(Path(row["photo_path"]).is_file())
         await self.app.deleted(deletion())
@@ -300,7 +314,7 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
         self.bot.send_photo.assert_awaited_once()
         self.assertEqual(self.bot.send_photo.await_args.args[0], 1)
 
-    async def test_deletion_waits_for_photo_archive(self):
+    async def test_deletion_record_does_not_wait_for_photo_download(self):
         started, release = asyncio.Event(), asyncio.Event()
         async def download(path, destination):
             started.set()
@@ -311,15 +325,19 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(started.wait(), 1)
         deleting = asyncio.create_task(self.app.deleted(deletion()))
         await asyncio.sleep(0)
-        self.assertFalse(deleting.done())
+        self.assertTrue(deleting.done())
+        self.assertTrue(self.archive.get(1, 2, 10)["deleted"])
         release.set()
         await asyncio.wait_for(asyncio.gather(saving, deleting), 1)
-        self.assertTrue(Path(self.pending()[0]["photo_path"]).is_file())
+        await self.finish_jobs()
+        self.assertTrue(Path(self.archive.get(1, 2, 10)["photo_path"]).is_file())
 
     async def test_photo_failure_preserves_text_and_does_not_delete(self):
+        self.archive.preference(1, mode="safe")
         self.archive.mute(1, 2, True)
         self.bot.download_file.side_effect = OSError("offline")
         await self.app.business_message(message("caption", photo=True))
+        await self.finish_jobs()
         self.assertEqual(self.archive.get(1, 2, 10)["text"], "caption")
         self.bot.delete_business_messages.assert_not_awaited()
 
@@ -372,12 +390,14 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
     async def test_archive_pagination_and_invalid_page(self):
         for mid in range(12):
             await self.app.business_message(message(f"text{mid}", mid=mid))
-        await self.app.private(private("/archive 2"))
+        key = self.archive.known_chat(1, 2)["key"]
+        await self.app.show_conversation(1, key, page=1)
         text = "".join(call.args[1] for call in self.bot.send_message.await_args_list)
-        self.assertIn("страница 2/3", text)
-        self.assertIn("/archive 3", text)
+        self.assertIn("2/3", text)
+        buttons = self.bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertTrue(any(button.callback_data == f"chat:{key}:2" for row in buttons for button in row))
         await self.app.private(private("/archive -1"))
-        self.assertIn("номер страницы", self.bot.send_message.await_args.args[1])
+        self.assertIn("Страница", self.bot.send_message.await_args.args[1])
 
     async def test_floodwait_sets_shared_cooldown_and_retries(self):
         operation = AsyncMock(side_effect=[TelegramRetryAfter(
@@ -419,8 +439,10 @@ class VeltrixTests(unittest.IsolatedAsyncioTestCase):
         self.bot.download_file.side_effect = download
         task = asyncio.create_task(self.app.guarded(self.app.business_message)(message(photo=True)))
         await asyncio.wait_for(started.wait(), 1)
+        downloads = list(self.app.media_tasks.values())
         await asyncio.wait_for(self.app.close(), 1)
-        self.assertTrue(task.cancelled())
+        self.assertTrue(task.done())
+        self.assertTrue(all(download.cancelled() for download in downloads))
         self.assertFalse(self.app.handler_tasks)
         self.assertTrue(self.app.closing)
 
@@ -439,11 +461,14 @@ class ConfigurationTests(unittest.TestCase):
     def test_bot_token_only_and_delay_validation(self):
         token = "123456:" + "x" * 35
         with patch("main.load_dotenv"), patch.dict(os.environ, {"BOT_TOKEN": token}, clear=True):
-            self.assertEqual(configuration(), (token, 1.5))
-            for value in ("0", "nan", "inf", "wrong"):
+            self.assertEqual(configuration(), (token, 0.1))
+            for value in ("-1", "nan", "inf", "wrong"):
                 os.environ["SPAM_DELAY"] = value
                 with self.assertRaises(ValueError):
                     configuration()
+            for value in ("0", "0.01", "0.5"):
+                os.environ["SPAM_DELAY"] = value
+                self.assertEqual(configuration()[1], float(value))
         with patch("main.load_dotenv"), patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "BOT_TOKEN"):
                 configuration()
@@ -489,6 +514,9 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 for update in updates:
                     await dispatcher.feed_update(bot, update)
+                    jobs = list(app.mute_tasks.values())
+                    if jobs:
+                        await asyncio.gather(*jobs)
                 self.assertTrue(archive.is_muted(1, 2))
                 self.assertEqual(archive.get(1, 2, 10)["text"], "saved")
                 self.assertTrue(archive.get(1, 2, 10)["deleted"])
@@ -496,6 +524,11 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("editMessageText", names)
                 self.assertIn("deleteBusinessMessages", names)
                 self.assertIn("sendMessage", names)
+                key = archive.known_chat(1, 2)["key"]
+                await dispatcher.feed_update(bot, Update(update_id=7, callback_query=CallbackQuery(
+                    id="callback-test", from_user=user(1), chat_instance="test-chat",
+                    data=f"chat:{key}:-1", message=private("panel"))))
+                self.assertIn("answerCallbackQuery", [call.__api_method__ for call in session.calls])
             finally:
                 await app.close()
                 await bot.session.close()

@@ -1,4 +1,4 @@
-"""Veltrix: one server-side Telegram bot for multiple connected accounts."""
+"""Veltrix: a multi-user Telegram Secretary bot. Python 3.11+."""
 
 import asyncio
 import hashlib
@@ -7,7 +7,6 @@ import logging
 import math
 import os
 import re
-import sqlite3
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -20,343 +19,260 @@ from aiogram.exceptions import (
     TelegramNetworkError,
     TelegramRetryAfter,
 )
-from aiogram.types import FSInputFile, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import FSInputFile, LinkPreviewOptions, Message
 from dotenv import load_dotenv
+
+import interface as ui
+from storage import Archive
 
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("veltrix")
-PAGE_SIZE = 5
-INSTRUCTIONS = """Подключение Veltrix
-1. Откройте настройки своего профиля Telegram → «Чат-боты» / Chatbots.
-В некоторых версиях приложения раздел находится в «Telegram для бизнеса».
-2. Добавьте этого бота и выберите чаты, к которым разрешаете доступ.
-3. Разрешите ответы и удаление всех сообщений в выбранных чатах.
-4. Вернитесь сюда и отправьте /status.
-
-Если раздела нет, обновите официальный клиент Telegram. Одного /start
-недостаточно: подключение нужно подтвердить в настройках Telegram.
-Номер телефона, коды входа, пароль и API-ключи здесь не нужны.
-
-После подключения новые входящие сообщения и обычные фотографии будут
-сохраняться на сервере Veltrix. Удаления и изменения поступят сюда.
-Владелец сервера технически имеет доступ к сохранённым данным.
-Выбирайте только те чаты, которые готовы доверить этому сервису.
-История до подключения и секретные чаты недоступны.
-/stop — остановить обработку; /erase confirm — удалить свой архив с сервера.
-Отключить доступ Telegram можно в том же разделе «Чат-боты»."""
-HELP = """Veltrix
-В подключённой личной переписке, от имени владельца аккаунта:
-.spam 10 привет — 10 отдельных сообщений
-.stopspam — остановить отправку в этом чате
-.mute — архивировать и удалять новые входящие сообщения
-.unmute — отключить мут
-.help — справка
-
-В диалоге с Veltrix:
-/connect — инструкция подключения
-/status — подключение и выданные права
-/chats — известные боту чаты и их ID
-/archive — свой архив; /archive 2 — следующая страница
-/mute ID и /unmute ID — управление мутом по ID из /chats
-/spam ID 10 привет — отправка в известный подключённый чат
-/stopspam ID — остановить её
-.spam 10 тест — тест здесь, сообщениями от бота
-.spam forever тест — непрерывный тест ТОЛЬКО здесь
-.stopspam — остановить тест
-/stop — приостановить обработку и все свои отправки
-/start — возобновить обработку
-/erase confirm — остановить обработку и удалить свой архив
-
-Конечное количество не ограничено в коде. Telegram ограничивает частоту
-и отправку от вашего имени: обычно нужны входящие за последние 24 часа.
-Права и выбранные вами чаты определяют доступные действия.
-Уведомления приходят сюда, не в «Избранное»."""
-MENU = ReplyKeyboardMarkup(keyboard=[
-    [KeyboardButton(text="/status"), KeyboardButton(text="/connect")],
-    [KeyboardButton(text="/archive"), KeyboardButton(text="/chats")],
-    [KeyboardButton(text="/help")],
-], resize_keyboard=True)
-
-
-class Archive:
-    """All user data lives locally on the bot server, never in GitHub."""
-
-    def __init__(self, directory):
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.media = self.directory / "media"
-        self.media.mkdir(exist_ok=True)
-        # Keep the old userbot database separate and untouched.
-        self.db = sqlite3.connect(self.directory / "veltrix.sqlite3")
-        self.db.row_factory = sqlite3.Row
-        self.db.executescript("""
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS users (
-                owner_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS connections (
-                id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL,
-                enabled INTEGER NOT NULL, rights TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS connection_owner ON connections(owner_id);
-            CREATE TABLE IF NOT EXISTS chats (
-                owner_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
-                title TEXT NOT NULL, last_seen INTEGER NOT NULL,
-                PRIMARY KEY (owner_id, chat_id)
-            );
-            CREATE TABLE IF NOT EXISTS muted (
-                owner_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
-                PRIMARY KEY (owner_id, chat_id)
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                owner_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL, sender_id INTEGER NOT NULL,
-                sender_name TEXT NOT NULL, text TEXT NOT NULL, date INTEGER NOT NULL,
-                media_note TEXT NOT NULL, photo_id TEXT, photo_path TEXT,
-                deleted INTEGER NOT NULL DEFAULT 0,
-                suppressed INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (owner_id, chat_id, message_id)
-            );
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL,
-                text TEXT NOT NULL, photo_path TEXT, text_offset INTEGER NOT NULL DEFAULT 0,
-                delivered INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0
-            );
-        """)
-
-    def user(self, owner):
-        return self.db.execute("SELECT * FROM users WHERE owner_id=?", (owner,)).fetchone()
-
-    def start_user(self, owner, chat_id):
-        with self.db:
-            self.db.execute("""INSERT INTO users VALUES (?, ?, 1)
-                ON CONFLICT(owner_id) DO UPDATE SET chat_id=excluded.chat_id, active=1""",
-                            (owner, chat_id))
-
-    def pause_user(self, owner):
-        with self.db:
-            self.db.execute("UPDATE users SET active=0 WHERE owner_id=?", (owner,))
-
-    def connection(self, connection_id):
-        row = self.db.execute("SELECT * FROM connections WHERE id=?", (connection_id,)).fetchone()
-        return dict(row, rights=json.loads(row["rights"])) if row else None
-
-    def active_connection(self, owner):
-        row = self.db.execute(
-            "SELECT id FROM connections WHERE owner_id=? AND enabled=1", (owner,)
-        ).fetchone()
-        return self.connection(row["id"]) if row else None
-
-    def save_connection(self, connection):
-        owner = connection.user.id
-        rights = connection.rights.model_dump() if connection.rights else {}
-        with self.db:
-            if connection.is_enabled:
-                self.db.execute("UPDATE connections SET enabled=0 WHERE owner_id=?", (owner,))
-            self.db.execute("""INSERT INTO connections VALUES (?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, rights=excluded.rights""",
-                            (connection.id, owner, int(connection.is_enabled), json.dumps(rights)))
-
-    def known_chat(self, owner, chat_id):
-        return self.db.execute("SELECT * FROM chats WHERE owner_id=? AND chat_id=?",
-                               (owner, chat_id)).fetchone()
-
-    def touch_chat(self, owner, message):
-        title = message.chat.full_name or str(message.chat.id)
-        with self.db:
-            self.db.execute("""INSERT INTO chats VALUES (?, ?, ?, ?)
-                ON CONFLICT(owner_id, chat_id) DO UPDATE SET
-                title=excluded.title, last_seen=MAX(last_seen, excluded.last_seen)""",
-                            (owner, message.chat.id, title, int(message.date.timestamp())))
-
-    def is_muted(self, owner, chat_id):
-        return self.db.execute("SELECT 1 FROM muted WHERE owner_id=? AND chat_id=?",
-                               (owner, chat_id)).fetchone() is not None
-
-    def mute(self, owner, chat_id, enabled):
-        with self.db:
-            if enabled:
-                self.db.execute("INSERT OR IGNORE INTO muted VALUES (?, ?)", (owner, chat_id))
-            else:
-                self.db.execute("DELETE FROM muted WHERE owner_id=? AND chat_id=?", (owner, chat_id))
-
-    def get(self, owner, chat_id, message_id):
-        return self.db.execute(
-            "SELECT * FROM messages WHERE owner_id=? AND chat_id=? AND message_id=?",
-            (owner, chat_id, message_id),
-        ).fetchone()
-
-    def save_message(self, owner, message, note, photo_id, path):
-        sender = message.from_user
-        with self.db:
-            self.db.execute("""INSERT INTO messages
-                (owner_id, chat_id, message_id, sender_id, sender_name, text,
-                 date, media_note, photo_id, photo_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(owner_id, chat_id, message_id) DO UPDATE SET
-                text=excluded.text, sender_name=excluded.sender_name,
-                media_note=excluded.media_note, photo_id=excluded.photo_id,
-                photo_path=excluded.photo_path""",
-                (owner, message.chat.id, message.message_id, sender.id, sender.full_name,
-                 message.text or message.caption or "", int(message.date.timestamp()),
-                 note, photo_id, path))
-
-    def suppress(self, owner, chat_id, message_id, enabled=True):
-        with self.db:
-            self.db.execute("""UPDATE messages SET suppressed=?
-                WHERE owner_id=? AND chat_id=? AND message_id=?""",
-                            (int(enabled), owner, chat_id, message_id))
-
-    def enqueue(self, owner, text, photo_path=None):
-        with self.db:
-            self.db.execute("INSERT INTO notifications(owner_id, text, photo_path) VALUES (?, ?, ?)",
-                            (owner, text, photo_path))
-
-    def mark_deleted(self, row):
-        # Commit the deletion state and notification atomically.
-        with self.db:
-            self.db.execute("""UPDATE messages SET deleted=1
-                WHERE owner_id=? AND chat_id=? AND message_id=?""",
-                            (row["owner_id"], row["chat_id"], row["message_id"]))
-            if not row["suppressed"]:
-                self.db.execute(
-                    "INSERT INTO notifications(owner_id, text, photo_path) VALUES (?, ?, ?)",
-                    (row["owner_id"], self.describe(row, "🗑 Сообщение удалено"), row["photo_path"]),
-                )
-
-    @staticmethod
-    def describe(row, heading=None):
-        if heading is None:
-            heading = "🔇 Удалено мутом" if row["suppressed"] else (
-                "🗑 Удалено" if row["deleted"] else "📨 Сохранено")
-        return (f"{heading}\nОт: {row['sender_name']} (ID {row['sender_id']})\n"
-                f"Чат: {row['chat_id']}; сообщение: {row['message_id']}\n\n"
-                f"{row['text'] or '[Без текста]'}\n{row['media_note']}")
-
-    def erase(self, owner):
-        for path in self.media.glob(f"{int(owner)}_*"):
-            if path.is_file():
-                path.unlink()
-        with self.db:
-            for table in ("messages", "muted", "chats", "notifications", "connections"):
-                self.db.execute(f"DELETE FROM {table} WHERE owner_id=?", (owner,))
-            self.db.execute("UPDATE users SET active=0 WHERE owner_id=?", (owner,))
-        # Logical deletion, not secure erasure of disk blocks or backups.
-
-    def close(self):
-        self.db.close()
+HELP = ui.HELP
+INSTRUCTIONS = ui.CONNECT
+COMMANDS = {".mute", ".unmute", ".spam", ".stopspam", ".speed", ".help"}
 
 
 class Veltrix:
-    def __init__(self, bot, archive, delay=1.5):
-        self.bot = bot
-        self.archive = archive
-        self.delay = delay
+    def __init__(self, bot, archive, delay=0.1):
+        self.bot, self.archive, self.delay = bot, archive, delay
         self.spam_tasks = {}
-        self.locks = defaultdict(asyncio.Lock)
-        self.flood_until = 0.0
-        self.notification_task = None
+        self.media_tasks = {}
+        self.mute_tasks = {}
+        self.delete_started = {}
         self.handler_tasks = set()
+        self.locks = defaultdict(asyncio.Lock)
+        self.owner_locks = defaultdict(asyncio.Lock)
+        self.cooldowns = defaultdict(float)
+        self.media_slots = asyncio.Semaphore(3)
+        self.notification_task = None
+        self.maintenance_task = None
+        self.wakeup = asyncio.Event()
         self.closing = False
+        self.username = ""
 
-    async def telegram(self, operation):
+    @property
+    def flood_until(self):
+        return self.cooldowns["send"]
+
+    @flood_until.setter
+    def flood_until(self, value):
+        self.cooldowns["send"] = value
+
+    async def telegram(self, operation, *, lane="send"):
+        # A sendMessage cooldown must not artificially postpone deleteBusinessMessages.
+        # Each method family still observes every retry_after it receives.
         while True:
-            wait = self.flood_until - time.monotonic()
+            wait = self.cooldowns[lane] - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
                 continue
             try:
                 return await operation()
             except TelegramRetryAfter as exc:
-                seconds = max(1, exc.retry_after) + 1
-                self.flood_until = max(self.flood_until, time.monotonic() + seconds)
-                LOG.warning("Telegram requested a %s second cooldown", seconds)
+                seconds = max(0, exc.retry_after) + 0.05
+                self.cooldowns[lane] = max(self.cooldowns[lane], time.monotonic() + seconds)
+                LOG.warning("Telegram cooldown: %s, %.2fs", lane, seconds)
 
     async def send_text(self, chat_id, text, **kwargs):
-        for start in range(0, len(text), 1000):
-            await self.telegram(lambda start=start: self.bot.send_message(
-                chat_id, text[start:start + 1000], parse_mode=None, **kwargs
-            ))
+        for offset in range(0, len(text), 1000):
+            await self.telegram(lambda offset=offset: self.bot.send_message(
+                chat_id, text[offset:offset + 1000], parse_mode=None, **kwargs))
 
-    def require_connection(self, connection_id, *, reply=False, delete=False):
-        connection = self.archive.connection(connection_id)
+    async def card(self, chat_id, text, markup=None, *, message_id=None):
+        options = dict(parse_mode="HTML", reply_markup=markup,
+                       link_preview_options=LinkPreviewOptions(is_disabled=True))
+        if message_id is not None:
+            try:
+                return await self.telegram(lambda: self.bot.edit_message_text(
+                    text=text, chat_id=chat_id, message_id=message_id, **options))
+            except TelegramBadRequest as exc:
+                if "message is not modified" in exc.message.lower():
+                    return None
+                raise
+        return await self.telegram(lambda: self.bot.send_message(chat_id, text, **options))
+
+    def require_connection(self, cid, *, reply=False, delete=False):
+        connection = self.archive.connection(cid)
         user = self.archive.user(connection["owner_id"]) if connection else None
         if not connection or not connection["enabled"] or not user or not user["active"]:
             raise ValueError("Подключение выключено. Проверьте /status и настройки Telegram.")
-        rights = connection["rights"]
-        if reply and not rights.get("can_reply"):
-            raise ValueError("Нет права отвечать от вашего имени. Проверьте настройки подключения.")
-        if delete and not rights.get("can_delete_all_messages"):
+        if reply and not connection["rights"].get("can_reply"):
+            raise ValueError("Разрешите ответы от вашего имени в настройках подключения.")
+        if delete and not connection["rights"].get("can_delete_all_messages"):
             raise ValueError("Для мута разрешите удаление всех сообщений в выбранных чатах.")
         return connection
 
-    async def resolve_connection(self, connection_id):
-        connection = self.archive.connection(connection_id)
+    async def resolve_connection(self, cid):
+        connection = self.archive.connection(cid)
         if not connection:
-            data = await self.telegram(lambda: self.bot.get_business_connection(connection_id))
+            data = await self.telegram(lambda: self.bot.get_business_connection(cid), lane="control")
             self.archive.save_connection(data)
-            connection = self.archive.connection(connection_id)
+            connection = self.archive.connection(cid)
         return connection
 
-    async def stop_tasks(self, owner=None):
-        tasks = []
-        for key, task in list(self.spam_tasks.items()):
-            if owner is None or key[0] == owner:
-                self.spam_tasks.pop(key, None)
-                task.cancel()
-                tasks.append(task)
-        await asyncio.gather(*tasks, return_exceptions=True)
+    def enqueue(self, owner, text, **kwargs):
+        self.archive.enqueue(owner, text, **kwargs)
+        self.wakeup.set()
 
     async def connected(self, connection):
         self.archive.save_connection(connection)
-        await self.stop_tasks(connection.user.id)
+        await self.stop_tasks(connection.user.id, all_jobs=True)
         if self.archive.user(connection.user.id):
-            state = "подключён" if connection.is_enabled else "отключён"
-            self.archive.enqueue(connection.user.id, f"Veltrix {state}. Проверка: /status.")
+            status = "🟢 Veltrix подключён. Новая переписка будет сохраняться здесь." if connection.is_enabled else (
+                "⚪️ Подключение отключено. Сохранённые переписки остаются в архиве.")
+            self.enqueue(connection.user.id, status)
 
-    async def archive_message(self, owner, message):
-        previous = self.archive.get(owner, message.chat.id, message.message_id)
-        photo_id = message.photo[-1].file_id if message.photo else None
-        unsupported = message.has_protected_content or getattr(message, "ttl_seconds", None)
-        path, note = None, ""
-        if unsupported:
-            photo_id, note = None, "[Защищённое/одноразовое медиа не копируется]"
-        elif photo_id:
-            note = "[Фото]"
-            if previous and previous["photo_id"] == photo_id:
-                path = previous["photo_path"]
-        elif not message.text:
-            note = "[Нет текста; локально сохраняются только обычные фотографии]"
-        self.archive.save_message(owner, message, note, photo_id, path)
-        if photo_id and (not path or not Path(path).is_file()):
-            suffix = hashlib.sha256(photo_id.encode()).hexdigest()[:16]
-            target = self.archive.media / f"{owner}_{message.chat.id}_{message.message_id}_{suffix}.jpg"
-            try:
-                file = await self.telegram(lambda: self.bot.get_file(photo_id))
+    @staticmethod
+    def parse_delay(value):
+        try:
+            delay = float(str(value).replace(",", "."))
+            if not math.isfinite(delay) or delay < 0:
+                raise ValueError
+            return delay
+        except ValueError as exc:
+            raise ValueError("Пауза должна быть конечным числом от 0 секунд.") from exc
+
+    @staticmethod
+    def parse_count(value, test=False):
+        if value == "forever":
+            if test:
+                return None
+            raise ValueError("Непрерывный тест доступен только в диалоге с Veltrix.")
+        try:
+            count = int(value)
+            if count <= 0:
+                raise ValueError
+            return count
+        except ValueError as exc:
+            raise ValueError("Количество должно быть положительным целым числом.") from exc
+
+    def delay_for(self, owner):
+        user = self.archive.user(owner)
+        return self.delay if not user or user["spam_delay"] is None else user["spam_delay"]
+
+    def chat_name(self, owner, chat_id):
+        chat = self.archive.known_chat(owner, chat_id)
+        return chat["title"] if chat else "Переписка"
+
+    def _schedule_media(self, row):
+        key = (row["owner_id"], row["chat_id"], row["message_id"])
+        if key not in self.media_tasks and row["photo_state"] in {"pending", "retry"} and row["photo_retry_at"] <= time.time():
+            self.media_tasks[key] = asyncio.create_task(self._download_photo(dict(row)))
+
+    async def _download_photo(self, row):
+        owner, chat_id, mid = row["owner_id"], row["chat_id"], row["message_id"]
+        key = (owner, chat_id, mid)
+        digest = hashlib.sha256(row["photo_id"].encode()).hexdigest()[:16]
+        target = self.archive.media / f"{owner}_{chat_id}_{mid}_{digest}.jpg"
+        partial = target.with_name(f"{target.stem}_{id(asyncio.current_task()):x}.part")
+        try:
+            async with self.media_slots:
+                file = await self.telegram(lambda: self.bot.get_file(row["photo_id"]), lane="media")
                 if not file.file_path:
-                    raise ValueError("Photo has no download path")
-                await self.telegram(lambda: self.bot.download_file(file.file_path, destination=target))
-                if not target.is_file():
-                    raise OSError("Photo was not written")
-                path = str(target.resolve())
-                self.archive.save_message(owner, message, note, photo_id, path)
-            except Exception as exc:
-                LOG.warning("Photo archive failed: %s", type(exc).__name__)
-                self.archive.save_message(owner, message, "[Фото не удалось сохранить]", photo_id, None)
-                return previous, False
+                    raise ValueError("Photo download path unavailable")
+                await self.telegram(lambda: self.bot.download_file(file.file_path, destination=partial), lane="media")
+                latest = self.archive.get(owner, chat_id, mid)
+                if not latest or latest["photo_id"] != row["photo_id"]:
+                    return
+                if not partial.is_file():
+                    raise OSError("Photo was not downloaded")
+                partial.replace(target)
+                self.archive.finish_photo(row, str(target.resolve()))
+                latest = self.archive.get(owner, chat_id, mid)
+                if latest and latest["delete_pending"]:
+                    self._schedule_mute(latest)
+                self.wakeup.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.warning("Photo archive failed: %s", type(exc).__name__)
+            self.archive.finish_photo(row)
+            latest = self.archive.get(owner, chat_id, mid)
+            if latest and latest["delete_pending"]:
+                self._schedule_mute(latest)
+        finally:
+            partial.unlink(missing_ok=True)
+            if self.media_tasks.get(key) is asyncio.current_task():
+                self.media_tasks.pop(key, None)
+
+    def _schedule_mute(self, row):
+        owner, chat_id, mid = row["owner_id"], row["chat_id"], row["message_id"]
+        if row["deleted"] or not row["delete_pending"]:
+            return
+        user = self.archive.user(owner)
+        if not user or not user["active"]:
+            return
+        connection = self.archive.connection(row["connection_id"])
+        if not connection or not connection["enabled"] or not connection["rights"].get("can_delete_all_messages"):
+            self.archive.suppress(owner, chat_id, mid, bool(row["suppressed"]), pending=False)
+            return
+        if user["mute_mode"] == "safe" and row["photo_state"] in {"pending", "retry"}:
+            return
+        if user["mute_mode"] == "safe" and row["photo_state"] == "failed":
+            self.archive.suppress(owner, chat_id, mid, False, pending=False)
+            self.enqueue(owner, f"Не удалось скачать фото из переписки «{self.chat_name(owner, chat_id)}». "
+                         "В режиме сохранения фото оригинал оставлен на месте.")
+            return
+        key = (owner, chat_id, mid)
+        if key not in self.mute_tasks:
+            self.mute_tasks[key] = asyncio.create_task(self._mute_message(dict(row)))
+
+    async def _mute_message(self, row):
+        owner, chat_id, mid = row["owner_id"], row["chat_id"], row["message_id"]
+        key = (owner, chat_id, mid)
+        try:
+            async def delete():
+                latest = self.archive.get(owner, chat_id, mid)
+                if not latest or latest["deleted"] or not self.archive.is_muted(owner, chat_id):
+                    return False
+                self.require_connection(row["connection_id"], delete=True)
+                self.archive.suppress(owner, chat_id, mid)
+                self.delete_started[key] = asyncio.current_task()
+                return await self.bot.delete_business_messages(row["connection_id"], [mid])
+            result = await self.telegram(delete, lane="delete")
+            latest = self.archive.get(owner, chat_id, mid)
+            if result is False:
+                self.archive.suppress(owner, chat_id, mid, bool(row["suppressed"]), pending=False)
+            elif latest:
+                self.archive.mark_deleted(latest)
+        except asyncio.CancelledError:
+            # A request can reach Telegram before local cancellation. Keep its marker.
+            raise
+        except (TelegramBadRequest, TelegramForbiddenError, ValueError):
+            self.archive.suppress(owner, chat_id, mid, bool(row["suppressed"]), pending=False)
+            if self.archive.is_muted(owner, chat_id):
+                self.enqueue(owner, f"⚠️ Telegram не разрешил удалить сообщение в переписке "
+                             f"«{self.chat_name(owner, chat_id)}». Копия сохранена. Проверьте права в /status.")
+        except Exception as exc:
+            LOG.warning("Mute request failed: %s", type(exc).__name__)
+            # Avoid tight retries and retain suppression on an uncertain RPC result.
+            with self.archive.db:
+                self.archive.db.execute("UPDATE messages SET delete_pending=0 WHERE owner_id=? AND chat_id=? AND message_id=?", key)
+            self.enqueue(owner, f"⚠️ Не удалось подтвердить удаление в переписке «{self.chat_name(owner, chat_id)}». "
+                         "Копия сохранена; результат запроса неизвестен из-за сетевой ошибки.")
+        finally:
+            if self.delete_started.get(key) is asyncio.current_task():
+                self.delete_started.pop(key, None)
+            if self.mute_tasks.get(key) is asyncio.current_task():
+                self.mute_tasks.pop(key, None)
+
+    async def archive_message(self, owner, message, *, edited=False, mute_pending=False):
+        photo = message.photo[-1].file_id if message.photo else None
+        unsupported = message.has_protected_content or getattr(message, "ttl_seconds", None)
+        if unsupported:
+            photo, note = None, "Защищённое или одноразовое медиа не копируется"
+        elif photo:
+            note = "Фото"
+        elif message.text is None:
+            note = "Вложение: сохранены текст и подпись, файл не скачивается"
+        else:
+            note = ""
+        previous = self.archive.save_message(owner, message, note, photo, edited=edited, mute_pending=mute_pending)
         return previous, True
 
     async def business_message(self, message, edited=False):
         cid = message.business_connection_id
-        if (not cid or message.chat.type != "private" or not message.from_user
-                or message.sender_business_bot):
-            return
-        # Owner commands bypass downloads/deletions to keep stop responsive.
-        connection = self.archive.connection(cid)
-        if connection and message.from_user.id == connection["owner_id"]:
-            if not edited:
-                await self.business_command(message, connection)
+        if not cid or message.chat.type != "private" or not message.from_user:
             return
         async with self.locks[cid]:
             connection = await self.resolve_connection(cid)
@@ -364,41 +280,21 @@ class Veltrix:
             user = self.archive.user(owner)
             if not connection["enabled"] or not user or not user["active"]:
                 return
-            if message.from_user.id == owner:
-                if not edited:
-                    await self.business_command(message, connection)
-                return
-            self.archive.touch_chat(owner, message)
-            previous, saved = await self.archive_message(owner, message)
-            text = message.text or message.caption or ""
-            if edited:
-                if previous and previous["text"] != text:
-                    self.archive.enqueue(owner,
-                        f"✏️ Сообщение изменено\nОт: {message.from_user.full_name} "
-                        f"(ID {message.from_user.id})\nЧат: {message.chat.id}; "
-                        f"сообщение: {message.message_id}\n\n"
-                        f"Было:\n{previous['text'] or '[Без текста]'}\n\n"
-                        f"Стало:\n{text or '[Без текста]'}")
-                return
-            if saved and self.archive.is_muted(owner, message.chat.id):
-                try:
-                    self.require_connection(cid, delete=True)
-                except ValueError:
-                    return
-                self.archive.suppress(owner, message.chat.id, message.message_id)
-                try:
-                    async def delete():
-                        self.require_connection(cid, delete=True)
-                        return await self.bot.delete_business_messages(cid, [message.message_id])
-                    await self.telegram(delete)
-                    row = self.archive.get(owner, message.chat.id, message.message_id)
-                    self.archive.mark_deleted(row)
-                except (TelegramBadRequest, TelegramForbiddenError, ValueError):
-                    self.archive.suppress(owner, message.chat.id, message.message_id, False)
-                    self.archive.enqueue(owner,
-                        f"⚠️ Не удалось удалить сообщение {message.message_id} "
-                        f"в чате {message.chat.id}. Оно сохранено. Проверьте права в /status.")
-                # Keep suppression on ambiguous network failure/cancellation.
+            mute_pending = (not edited and message.from_user.id != owner and not message.sender_business_bot
+                            and self.archive.is_muted(owner, message.chat.id)
+                            and connection["rights"].get("can_delete_all_messages"))
+            await self.archive_message(owner, message, edited=edited, mute_pending=bool(mute_pending))
+            row = self.archive.get(owner, message.chat.id, message.message_id)
+            outgoing = bool(row["outgoing"])
+            # Start deletion immediately after the durable metadata commit, before downloads.
+            if not outgoing and not edited and not row["deleted"] and self.archive.is_muted(owner, message.chat.id):
+                if connection["rights"].get("can_delete_all_messages"):
+                    self._schedule_mute(row)
+            self._schedule_media(row)
+        if edited:
+            self.wakeup.set()
+        elif outgoing and not message.sender_business_bot:
+            await self.business_command(message, connection)
 
     async def edited(self, message):
         await self.business_message(message, edited=True)
@@ -409,10 +305,8 @@ class Veltrix:
             user = self.archive.user(connection["owner_id"])
             if not user or not user["active"] or not connection["enabled"]:
                 return
-            for message_id in event.message_ids:
-                row = self.archive.get(connection["owner_id"], event.chat.id, message_id)
-                if row and not row["deleted"]:
-                    self.archive.mark_deleted(row)
+            self.archive.delete_batch(connection["owner_id"], event.chat.id, event.message_ids)
+            self.wakeup.set()
 
     async def business_status(self, message, connection, text):
         try:
@@ -421,34 +315,53 @@ class Veltrix:
                 return await self.bot.edit_message_text(
                     text=text, chat_id=message.chat.id, message_id=message.message_id,
                     business_connection_id=connection["id"], parse_mode=None)
-            await self.telegram(edit)
+            result = await self.telegram(edit)
+            if isinstance(result, Message) and result.from_user:
+                result = result.model_copy(update={"business_connection_id": connection["id"]})
+                await self.archive_message(connection["owner_id"], result)
         except (TelegramAPIError, ValueError):
-            self.archive.enqueue(connection["owner_id"],
-                f"Чат {message.chat.id}: {text}\n"
-                "Не удалось отредактировать команду в переписке; результат показан здесь.")
+            self.enqueue(connection["owner_id"], f"{self.chat_name(connection['owner_id'], message.chat.id)}\n{text}")
+
+    async def set_mute(self, owner, chat_id, enabled):
+        self.archive.mute(owner, chat_id, enabled)
+        if not enabled:
+            for key, task in list(self.mute_tasks.items()):
+                if key[:2] == (owner, chat_id):
+                    row = self.archive.get(*key)
+                    started = key in self.delete_started or bool(row and row["suppressed"])
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    self.archive.suppress(*key, enabled=started, pending=False)
+            with self.archive.db:
+                self.archive.db.execute("UPDATE messages SET delete_pending=0 WHERE owner_id=? AND chat_id=?", (owner, chat_id))
 
     async def business_command(self, message, connection):
         parts = (message.text or "").split(maxsplit=2)
-        if not parts or parts[0] not in {".mute", ".unmute", ".spam", ".stopspam", ".help"}:
+        if not parts or parts[0] not in COMMANDS or message.from_user.id != connection["owner_id"]:
             return
         owner, chat_id = connection["owner_id"], message.chat.id
         try:
             self.require_connection(connection["id"])
-            self.archive.touch_chat(owner, message)
             if parts[0] == ".help":
-                status = HELP
+                status = "Veltrix\n.mute · .unmute\n.spam количество текст · .stopspam\n.speed секунды\nПолная справка — в диалоге с ботом."
             elif parts[0] in {".mute", ".unmute"}:
                 enabled = parts[0] == ".mute"
                 if enabled:
                     self.require_connection(connection["id"], delete=True)
-                self.archive.mute(owner, chat_id, enabled)
+                await self.set_mute(owner, chat_id, enabled)
                 status = "🔇 Мут активирован" if enabled else "🔊 Мут отключён"
             elif parts[0] == ".stopspam":
                 await self.stop_spam((owner, "business", chat_id))
                 status = "⏹ Отправка остановлена"
+            elif parts[0] == ".speed":
+                if len(parts) != 2:
+                    raise ValueError("Пример: .speed 0.1. Значение 0 убирает дополнительную паузу.")
+                delay = self.parse_delay(parts[1])
+                self.archive.preference(owner, delay=delay)
+                status = f"⚡ Пауза между сообщениями: {delay:g} с"
             else:
                 if len(parts) != 3:
-                    raise ValueError("Использование: .spam <количество> <текст>")
+                    raise ValueError("Использование: .spam количество текст")
                 count = self.parse_count(parts[1])
                 self.launch_spam(owner, chat_id, count, parts[2], connection["id"])
                 status = f"✅ Запущена отправка {count} сообщений"
@@ -456,25 +369,17 @@ class Veltrix:
             status = f"⚠️ {exc}"
         await self.business_status(message, connection, status)
 
-    @staticmethod
-    def parse_count(value, test=False):
-        if value == "forever":
-            if test:
-                return None
-            raise ValueError("Бесконечный тест разрешён только в личном диалоге с Veltrix.")
-        try:
-            count = int(value)
-            if count <= 0:
-                raise ValueError
-            return count
-        except ValueError as exc:
-            raise ValueError("Количество должно быть положительным целым числом.") from exc
-
     def launch_spam(self, owner, chat_id, count, text, connection_id=None):
         if not text.strip() or len(text.encode("utf-16-le")) // 2 > 4096:
             raise ValueError("Нужен непустой текст в пределах лимита одного сообщения Telegram.")
         if connection_id:
-            self.require_connection(connection_id, reply=True)
+            connection = self.require_connection(connection_id, reply=True)
+            if connection["owner_id"] != owner:
+                raise ValueError("Подключение недоступно")
+            if count is None:
+                raise ValueError("Непрерывная отправка разрешена только для теста в этом боте.")
+        elif not self.archive.user(owner) or chat_id != self.archive.user(owner)["chat_id"]:
+            raise ValueError("Тест доступен только в своём диалоге с Veltrix")
         key = (owner, "business" if connection_id else "test", chat_id)
         if key in self.spam_tasks:
             raise ValueError("Отправка уже запущена; сначала остановите её.")
@@ -488,23 +393,25 @@ class Veltrix:
                 async def send():
                     user = self.archive.user(owner)
                     if not user or not user["active"]:
-                        raise ValueError("Обработка остановлена.")
+                        raise ValueError("Обработка приостановлена")
                     if connection_id:
                         self.require_connection(connection_id, reply=True)
-                    return await self.bot.send_message(
-                        chat_id, text, business_connection_id=connection_id, parse_mode=None)
-                await self.telegram(send)
+                    return await self.bot.send_message(chat_id, text, business_connection_id=connection_id, parse_mode=None)
+                result = await self.telegram(send)
+                if connection_id and isinstance(result, Message) and result.from_user:
+                    result = result.model_copy(update={"business_connection_id": connection_id})
+                    await self.archive_message(owner, result)
                 sent += 1
                 if count is None or sent < count:
-                    await asyncio.sleep(self.delay)
+                    # Always yield even at zero delay, so stop commands can interrupt.
+                    await asyncio.sleep(self.delay_for(owner))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             LOG.warning("Sending stopped: %s", type(exc).__name__)
-            self.archive.enqueue(owner,
-                f"⚠️ Отправка в чате {chat_id} остановлена. Подтверждено сообщений: {sent}. "
-                f"Ошибка: {type(exc).__name__}. Проверьте права и активность чата. "
-                "При сетевом сбое последнее сообщение могло быть отправлено без подтверждения.")
+            self.enqueue(owner, f"⚠️ Отправка остановлена\n{self.chat_name(owner, chat_id)}\n"
+                         f"Подтверждено сообщений: {sent}. Проверьте доступность чата и права. "
+                         "При сетевом сбое последнее сообщение могло уйти без подтверждения.")
         finally:
             if self.spam_tasks.get(key) is asyncio.current_task():
                 self.spam_tasks.pop(key, None)
@@ -515,201 +422,383 @@ class Veltrix:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    async def stop_tasks(self, owner=None, *, all_jobs=False):
+        groups = [self.spam_tasks] + ([self.mute_tasks, self.media_tasks] if all_jobs else [])
+        pending = []
+        for group in groups:
+            for key, task in list(group.items()):
+                if owner is None or key[0] == owner:
+                    group.pop(key, None)
+                    task.cancel()
+                    pending.append(task)
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    async def show_home(self, owner, *, message_id=None, start=False):
+        user = self.archive.user(owner)
+        connected = self.archive.active_connection(owner)
+        text = ui.home(bool(connected), bool(user["active"]))
+        if not connected:
+            text += "\n\nОткройте «Подключение»: выберите бота и разрешённые чаты в настройках Telegram."
+            text += "\nНовые сообщения сохраняются на сервере Veltrix. Подробнее — в инструкции подключения."
+        markup = ui.MENU if start else ui.keyboard([
+            [("💬 Переписки", "chats:0"), ("⚙️ Настройки", "settings")],
+            [("🔌 Подключение", "connect"), ("❔ Помощь", "help")]])
+        await self.card(user["chat_id"], text, markup, message_id=message_id)
+
+    async def show_chats(self, owner, page=0, *, message_id=None):
+        if page < 0:
+            raise ValueError("Страница должна быть положительной")
+        rows, count = self.archive.chats(owner, page)
+        pages = max(1, (count + 7) // 8)
+        if page >= pages:
+            raise ValueError(f"В архиве страниц: {pages}")
+        text = "<b>Ваши переписки</b>\nВыберите диалог — внутри история, фото и скачивание архива."
+        buttons = []
+        for row in rows:
+            muted = "🔇 " if self.archive.is_muted(owner, row["chat_id"]) else ""
+            label = f"{muted}{ui.short(row['title'], 32)} · {row['total']}"
+            buttons.append([(label, f"chat:{row['key']}:-1")])
+        if not rows:
+            text += "\n\nПока пусто. Подключите бота и дождитесь нового сообщения в разрешённой переписке."
+        navigation = []
+        if page:
+            navigation.append(("‹ Назад", f"chats:{page - 1}"))
+        if page + 1 < pages:
+            navigation.append(("Далее ›", f"chats:{page + 1}"))
+        if navigation:
+            buttons.append(navigation)
+        buttons.append([("⌂ Главное меню", "home")])
+        await self.card(self.archive.user(owner)["chat_id"], text, ui.keyboard(buttons), message_id=message_id)
+
+    async def show_archive(self, owner, argument="", *, message_id=None):
+        try:
+            page = int(argument or "1") - 1
+        except ValueError as exc:
+            raise ValueError("Пример: /archive или /archive 2") from exc
+        await self.show_chats(owner, page, message_id=message_id)
+
+    async def show_conversation(self, owner, key, page=-1, *, message_id=None):
+        chat, rows, total, page, pages = self.archive.conversation(owner, key, page)
+        muted = self.archive.is_muted(owner, chat["chat_id"])
+        buttons = [[("🔊 Отключить мут" if muted else "🔇 Включить мут", f"mute:{key}"),
+                    ("⏹ Остановить отправку", f"stop:{key}")],
+                   [("📥 Скачать всю переписку", f"export:{key}")]]
+        for row in rows:
+            if row["photo_state"] == "ready":
+                label = "📷 Фото · " + ui.stamp(row["date"])
+                buttons.append([(label, f"photo:{key}:{row['message_id']}")])
+        nav = []
+        if page:
+            nav.append(("‹ Раньше", f"chat:{key}:{page - 1}"))
+        if page + 1 < pages:
+            nav.append(("Позже ›", f"chat:{key}:{page + 1}"))
+        if nav:
+            buttons.append(nav)
+        if pages > 1:
+            buttons.append([("В начало", f"chat:{key}:0"), ("Последние", f"chat:{key}:-1")])
+        buttons.append([("‹ Все переписки", "chats:0")])
+        await self.card(self.archive.user(owner)["chat_id"], ui.conversation(chat, rows, total, page, pages),
+                        ui.keyboard(buttons), message_id=message_id)
+
+    async def show_settings(self, owner, *, message_id=None):
+        user = self.archive.user(owner)
+        delay = self.delay_for(owner)
+        fast = user["mute_mode"] == "fast"
+        description = ("Запись и file_id сохраняются до удаления; фото скачивается в фоне." if fast else
+                       "Фото сначала скачивается на сервер. Удаление ждёт загрузки.")
+        text = (f"<b>Настройки</b>\n\n<b>Отправка</b>\nДополнительная пауза: <b>{delay:g} с</b>.\n"
+                "0 — без дополнительной паузы. Скорость всё равно зависит от API и ожиданий Telegram.\n\n"
+                f"<b>Мут: {'быстрый' if fast else 'сначала сохранить фото'}</b>\n{description}\n\n"
+                "Мгновенное удаление без задержки сети невозможно.")
+        rows = [[("0 с", "speed:0"), ("0.1 с", "speed:0.1"), ("0.3 с", "speed:0.3"), ("1 с", "speed:1")],
+                [("✓ Быстрый мут" if fast else "Быстрый мут", "mode:fast")],
+                [("Сначала сохранить фото" if fast else "✓ Сначала сохранить фото", "mode:safe")],
+                [("О данных", "privacy"), ("⌂ Меню", "home")]]
+        await self.card(user["chat_id"], text, ui.keyboard(rows), message_id=message_id)
+
+    async def show_status(self, owner, *, message_id=None):
+        user = self.archive.user(owner)
+        connection = self.archive.active_connection(owner)
+        rights = connection["rights"] if connection else {}
+        def yes(value):
+            return "✓" if value else "—"
+        text = ("<b>Подключение</b>\n\n"
+                f"{yes(connection)} Связь с Telegram\n{yes(user['active'])} Обработка сообщений\n"
+                f"{yes(rights.get('can_reply'))} Ответы от вашего имени\n"
+                f"{yes(rights.get('can_delete_all_messages'))} Удаление входящих\n\n"
+                "Только выбранные вами чаты. Для отправки нужны недавние входящие сообщения.")
+        await self.card(user["chat_id"], text, ui.keyboard([
+            [("Как подключить", "connect"), ("⌂ Меню", "home")]]), message_id=message_id)
+
+    async def show_info(self, owner, page, *, message_id=None):
+        text = {"help": ui.HELP, "connect": ui.CONNECT, "privacy": ui.PRIVACY}[page]
+        if page == "connect" and self.username:
+            text += f"\n\nВаш бот: <code>@{ui.esc(self.username)}</code>"
+        await self.card(self.archive.user(owner)["chat_id"], text, ui.keyboard([
+            [("Проверить подключение", "status"), ("О данных", "privacy")], [("⌂ Меню", "home")]]), message_id=message_id)
+
+    async def export_chat(self, owner, key):
+        async with self.owner_locks[owner]:
+            chat, rows, revisions = self.archive.snapshot(owner, key)
+            user = self.archive.user(owner)
+            task = asyncio.create_task(asyncio.to_thread(
+                ui.build_export, self.archive.exports, owner, chat, rows, revisions, self.archive.media))
+            path = None
+            try:
+                try:
+                    path, photos = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    result = await task
+                    result[0].unlink(missing_ok=True)
+                    raise
+                caption = f"{ui.short(chat['title'], 120)}\nСохранено: {ui.messages_count(len(rows))}. "
+                caption += "Внутри HTML-переписка и сохранённые фотографии." if photos else (
+                    "Весь текст сохранён. Фотографии не поместились в один файл и доступны в боте.")
+                await self.telegram(lambda: self.bot.send_document(user["chat_id"], FSInputFile(path), caption=caption))
+            finally:
+                if path:
+                    path.unlink(missing_ok=True)
+
+    async def erase_owner(self, owner):
+        self.archive.pause_user(owner)
+        await self.stop_tasks(owner, all_jobs=True)
+        async with self.owner_locks[owner]:
+            ids = [row[0] for row in self.archive.db.execute("SELECT id FROM connections WHERE owner_id=?", (owner,))]
+            locks = [self.locks[cid] for cid in sorted(ids)]
+            for lock in locks:
+                await lock.acquire()
+            try:
+                self.archive.erase(owner)
+            finally:
+                for lock in reversed(locks):
+                    lock.release()
+
     async def private(self, message):
-        if (message.chat.type != "private" or not message.from_user
-                or message.from_user.id != message.chat.id or message.from_user.is_bot):
+        if (message.chat.type != "private" or not message.from_user or message.from_user.is_bot
+                or message.from_user.id != message.chat.id):
             return
-        owner, chat_id = message.from_user.id, message.chat.id
-        parts = (message.text or "").split(maxsplit=1)
+        owner = message.from_user.id
+        text = {"💬 Переписки": "/archive", "⚙️ Настройки": "/settings", "🔌 Подключение": "/connect",
+                "❔ Помощь": "/help"}.get(message.text, message.text or "")
+        parts = text.split(maxsplit=1)
         if not parts:
             return
-        command = parts[0].split("@")[0]
-        argument = parts[1] if len(parts) > 1 else ""
+        command, argument = parts[0].split("@")[0], parts[1] if len(parts) > 1 else ""
         if command == "/start":
-            self.archive.start_user(owner, chat_id)
-            await self.send_text(chat_id, "Veltrix — помощник для подключённых личных чатов.\n\n"
-                                 + INSTRUCTIONS, reply_markup=MENU)
+            self.archive.start_user(owner, message.chat.id)
+            await self.show_home(owner, start=True)
             return
         user = self.archive.user(owner)
         if not user:
-            await self.send_text(chat_id, "Сначала нажмите /start.")
+            await self.send_text(message.chat.id, "Нажмите /start, чтобы открыть Veltrix.")
             return
         try:
-            if command in {"/connect", "/privacy"}:
-                await self.send_text(chat_id, INSTRUCTIONS)
-            elif command in {"/help", ".help"}:
-                await self.send_text(chat_id, HELP)
+            if command in {"/connect", "/privacy", "/help", ".help"}:
+                await self.show_info(owner, "help" if command == ".help" else command[1:])
             elif command == "/status":
-                connection = self.archive.active_connection(owner)
-                rights = connection["rights"] if connection else {}
-                await self.send_text(chat_id,
-                    f"Обработка: {'включена' if user['active'] else 'приостановлена'}\n"
-                    f"Подключение Telegram: {'есть' if connection else 'нет'}\n"
-                    f"Ответы от вашего имени: {'да' if rights.get('can_reply') else 'нет'}\n"
-                    f"Удаление входящих: {'да' if rights.get('can_delete_all_messages') else 'нет'}\n"
-                    "Доступны только выбранные в настройках Telegram чаты.\n"
-                    "Отправка зависит также от недавних входящих сообщений.\n"
-                    "Инструкция: /connect")
-            elif command == "/chats":
-                rows = self.archive.db.execute("""SELECT * FROM chats WHERE owner_id=?
-                    ORDER BY last_seen DESC LIMIT 30""", (owner,)).fetchall()
-                summary = "\n".join(
-                    f"{row['chat_id']} — {row['title']}"
-                    + (" 🔇" if self.archive.is_muted(owner, row["chat_id"]) else "") for row in rows)
-                await self.send_text(chat_id, "Последние известные чаты:\n" + (summary or
-                    "Пока пусто. Подключите бота и дождитесь нового сообщения в разрешённом чате."))
-            elif command == "/archive":
+                await self.show_status(owner)
+            elif command in {"/archive", "/chats"}:
                 await self.show_archive(owner, argument)
+            elif command == "/settings":
+                await self.show_settings(owner)
+            elif command in {"/speed", ".speed"}:
+                self.archive.preference(owner, delay=self.parse_delay(argument))
+                await self.show_settings(owner)
             elif command == "/stop":
                 self.archive.pause_user(owner)
-                await self.stop_tasks(owner)
-                await self.send_text(chat_id, "Обработка и отправки остановлены. Архив сохранён. "
-                                     "Возобновить: /start. Отозвать доступ: настройки Telegram → Чат-боты.")
+                await self.stop_tasks(owner, all_jobs=True)
+                await self.card(message.chat.id, "⏸ <b>Обработка приостановлена</b>\nАрхив сохранён. Возобновить: /start.")
             elif command == "/erase":
                 if argument != "confirm":
-                    await self.send_text(chat_id, "Чтобы удалить свой архив с сервера и остановить "
-                                         "обработку, отправьте /erase confirm. Сообщения, уже доставленные "
-                                         "в этот диалог, удалите отдельно в Telegram.")
+                    await self.card(message.chat.id, "<b>Удаление своего архива</b>\nОтправьте <code>/erase confirm</code>. "
+                                    "Уже доставленные сообщения в Telegram удаляются отдельно.")
                 else:
-                    self.archive.pause_user(owner)
-                    await self.stop_tasks(owner)
-                    ids = [row[0] for row in self.archive.db.execute(
-                        "SELECT id FROM connections WHERE owner_id=?", (owner,))]
-                    locks = [self.locks[cid] for cid in sorted(ids)]
-                    for lock in locks:
-                        await lock.acquire()
-                    try:
-                        self.archive.erase(owner)
-                    finally:
-                        for lock in reversed(locks):
-                            lock.release()
-                    await self.send_text(chat_id, "Архив и настройки удалены с сервера. "
-                                         "Обработка выключена. Отзовите подключение в Telegram. "
-                                         "Ранее отправленные уведомления остаются в этом диалоге.")
+                    await self.erase_owner(owner)
+                    await self.card(message.chat.id, "<b>Архив удалён с сервера</b>\nОбработка выключена. "
+                                    "Отзовите доступ в настройках Telegram. Копии в этом диалоге остаются.")
             elif command in {"/mute", "/unmute", "/spam", "/stopspam"}:
                 connection = self.archive.active_connection(owner)
                 if not connection:
-                    raise ValueError("Нет активного подключения. Инструкция: /connect")
+                    raise ValueError("Сначала подключите бота: /connect")
                 self.require_connection(connection["id"])
                 args = argument.split(maxsplit=2)
                 try:
                     target = int(args[0])
                 except (ValueError, IndexError) as exc:
-                    raise ValueError("Укажите ID своего чата из /chats после команды.") from exc
+                    raise ValueError("Выберите переписку кнопкой в разделе «Переписки» или укажите ID после команды.") from exc
                 if not self.archive.known_chat(owner, target) or target == owner:
-                    raise ValueError("Чат не найден среди ваших подключённых переписок: /chats")
+                    raise ValueError("Переписка недоступна")
                 if command in {"/mute", "/unmute"}:
                     enabled = command == "/mute"
                     if enabled:
                         self.require_connection(connection["id"], delete=True)
-                    self.archive.mute(owner, target, enabled)
-                    await self.send_text(chat_id, "🔇 Мут активирован" if enabled else "🔊 Мут отключён")
+                    await self.set_mute(owner, target, enabled)
+                    await self.card(message.chat.id, "🔇 Мут активирован" if enabled else "🔊 Мут отключён")
                 elif command == "/stopspam":
                     await self.stop_spam((owner, "business", target))
-                    await self.send_text(chat_id, "⏹ Отправка остановлена")
+                    await self.card(message.chat.id, "⏹ Отправка остановлена")
                 else:
                     if len(args) != 3:
-                        raise ValueError("Использование: /spam ID количество текст")
-                    count = self.parse_count(args[1])
-                    self.launch_spam(owner, target, count, args[2], connection["id"])
-                    await self.send_text(chat_id, f"✅ Запущена отправка {count} сообщений")
+                        raise ValueError("Пример: /spam ID количество текст")
+                    self.launch_spam(owner, target, self.parse_count(args[1]), args[2], connection["id"])
+                    await self.card(message.chat.id, "✅ Отправка запущена")
             elif command == ".spam":
                 if not user["active"]:
-                    raise ValueError("Обработка остановлена. Возобновить: /start")
+                    raise ValueError("Обработка приостановлена. Возобновить: /start")
                 args = argument.split(maxsplit=1)
                 if len(args) != 2:
-                    raise ValueError("Использование для теста здесь: .spam количество текст")
-                count = self.parse_count(args[0], test=True)
-                self.launch_spam(owner, chat_id, count, args[1])
-                await self.send_text(chat_id, "✅ Запущен тест в диалоге с Veltrix")
+                    raise ValueError("Пример теста здесь: .spam 10 привет")
+                self.launch_spam(owner, message.chat.id, self.parse_count(args[0], test=True), args[1])
+                await self.card(message.chat.id, "✅ Тест отправки запущен\nОстановка: <code>.stopspam</code>")
             elif command == ".stopspam":
-                await self.stop_spam((owner, "test", chat_id))
-                await self.send_text(chat_id, "⏹ Тест остановлен")
+                await self.stop_spam((owner, "test", message.chat.id))
+                await self.card(message.chat.id, "⏹ Тест остановлен")
             else:
-                await self.send_text(chat_id, "Команды: /help. Подключение: /connect.")
+                await self.show_home(owner)
         except ValueError as exc:
-            await self.send_text(chat_id, f"⚠️ {exc}")
+            await self.card(message.chat.id, "⚠️ " + ui.esc(exc))
 
-    async def show_archive(self, owner, argument):
-        try:
-            page = int(argument or "1")
-            if page < 1:
-                raise ValueError
-        except ValueError as exc:
-            raise ValueError("Использование: /archive или /archive 2; номер страницы >= 1.") from exc
-        count = self.archive.db.execute("SELECT COUNT(*) FROM messages WHERE owner_id=?",
-                                        (owner,)).fetchone()[0]
-        pages = max(1, (count + PAGE_SIZE - 1) // PAGE_SIZE)
-        if page > pages:
-            raise ValueError(f"Страниц в архиве: {pages}.")
-        rows = self.archive.db.execute("""SELECT * FROM messages WHERE owner_id=?
-            ORDER BY date DESC, message_id DESC, chat_id DESC LIMIT ? OFFSET ?""",
-                                       (owner, PAGE_SIZE, (page - 1) * PAGE_SIZE)).fetchall()
+    async def callback(self, query):
+        owner = query.from_user.id
         user = self.archive.user(owner)
-        await self.send_text(user["chat_id"], f"Архив: страница {page}/{pages}; сообщений: {count}.")
-        for row in rows:
-            await self.send_text(user["chat_id"], self.archive.describe(row))
-            if row["photo_path"] and Path(row["photo_path"]).is_file():
-                await self.telegram(lambda row=row: self.bot.send_photo(
-                    user["chat_id"], FSInputFile(row["photo_path"]),
-                    caption=f"Сохранённое фото: сообщение {row['message_id']}"))
-        if page < pages:
-            await self.send_text(user["chat_id"], f"Далее: /archive {page + 1}")
+        if not user or not query.message or query.message.chat.id != user["chat_id"]:
+            await self.telegram(lambda: query.answer("Откройте свой диалог с Veltrix и нажмите /start.", show_alert=True), lane="control")
+            return
+        answered = False
+        try:
+            data = (query.data or "").split(":")
+            action = data[0]
+            key = None
+            if action in {"chat", "mute", "stop", "export", "photo"}:
+                key = int(data[1])
+                chat = self.archive.chat_by_key(owner, key)
+                if not chat:
+                    raise ValueError("Переписка недоступна")
+            # Callback acknowledgements do not sit behind sendMessage cooldowns.
+            await self.telegram(lambda: query.answer(text="Готовлю архив…" if action == "export" else None), lane="control")
+            answered = True
+            mid = query.message.message_id
+            if action == "home":
+                await self.show_home(owner, message_id=mid)
+            elif action in {"connect", "help", "privacy"}:
+                await self.show_info(owner, action, message_id=mid)
+            elif action == "status":
+                await self.show_status(owner, message_id=mid)
+            elif action == "settings":
+                await self.show_settings(owner, message_id=mid)
+            elif action == "speed":
+                self.archive.preference(owner, delay=self.parse_delay(data[1]))
+                await self.show_settings(owner, message_id=mid)
+            elif action == "mode":
+                self.archive.preference(owner, mode=data[1])
+                await self.show_settings(owner, message_id=mid)
+            elif action == "chats":
+                await self.show_chats(owner, int(data[1]), message_id=mid)
+            elif action == "chat":
+                await self.show_conversation(owner, key, int(data[2]), message_id=mid)
+            elif action == "mute":
+                connection = self.archive.active_connection(owner)
+                if not connection:
+                    raise ValueError("Подключите бота: /connect")
+                enabled = not self.archive.is_muted(owner, chat["chat_id"])
+                self.require_connection(connection["id"], delete=enabled)
+                await self.set_mute(owner, chat["chat_id"], enabled)
+                await self.show_conversation(owner, key, message_id=mid)
+            elif action == "stop":
+                await self.stop_spam((owner, "business", chat["chat_id"]))
+                await self.show_conversation(owner, key, message_id=mid)
+            elif action == "export":
+                await self.export_chat(owner, key)
+            elif action == "photo":
+                row = self.archive.get(owner, chat["chat_id"], int(data[2]))
+                if not row or not row["photo_path"] or not Path(row["photo_path"]).is_file():
+                    raise ValueError("Фото ещё загружается или недоступно")
+                await self.telegram(lambda: self.bot.send_photo(user["chat_id"], FSInputFile(row["photo_path"])))
+        except (ValueError, IndexError) as exc:
+            text = str(exc) if isinstance(exc, ValueError) and not str(exc).startswith("invalid literal") else "Кнопка недоступна. Откройте меню заново."
+            if not answered:
+                await self.telegram(lambda: query.answer(text=text[:180], show_alert=True), lane="control")
+            else:
+                await self.card(user["chat_id"], "⚠️ " + ui.esc(text))
 
     async def deliver_notifications(self):
-        rows = self.archive.db.execute("""SELECT n.*, u.chat_id FROM notifications n
-            JOIN users u ON u.owner_id=n.owner_id
-            WHERE n.delivered=0 AND n.retry_at<=? AND u.active=1
-            ORDER BY n.id LIMIT 20""", (time.time(),)).fetchall()
+        rows = self.archive.db.execute("""SELECT n.*,u.chat_id FROM notifications n JOIN users u USING(owner_id)
+            WHERE n.delivered=0 AND n.retry_at<=? AND u.active=1 ORDER BY n.id LIMIT 30""", (time.time(),)).fetchall()
         for row in rows:
+            owner = row["owner_id"]
+            payload = json.loads(row["payload"])
             def eligible(row=row):
                 user = self.archive.user(row["owner_id"])
-                exists = self.archive.db.execute(
-                    "SELECT 1 FROM notifications WHERE id=?", (row["id"],)).fetchone()
+                exists = self.archive.db.execute("SELECT 1 FROM notifications WHERE id=?", (row["id"],)).fetchone()
                 return user and user["active"] and exists
             if not eligible():
                 continue
             try:
-                offset = row["text_offset"]
-                while offset < len(row["text"]):
-                    async def send_piece(row=row, offset=offset, eligible=eligible):
+                chat = self.archive.known_chat(owner, payload["chat_id"]) if payload.get("chat_id") else None
+                buttons = ui.keyboard([[("💬 Открыть переписку", f"chat:{chat['key']}:-1")]]) if chat else None
+                if not row["text_sent"]:
+                    async def send_notice(row=row, payload=payload, buttons=buttons, eligible=eligible):
                         if not eligible():
                             raise ValueError("Notification paused or erased")
-                        return await self.bot.send_message(
-                            row["chat_id"], row["text"][offset:offset + 1000], parse_mode=None)
-                    await self.telegram(send_piece)
-                    offset += 1000
+                        return await self.bot.send_message(row["chat_id"], ui.notice(payload, row["text"]),
+                            parse_mode="HTML", reply_markup=buttons, link_preview_options=LinkPreviewOptions(is_disabled=True))
+                    await self.telegram(send_notice)
                     with self.archive.db:
-                        self.archive.db.execute("UPDATE notifications SET text_offset=? WHERE id=?",
-                                                (offset, row["id"]))
-                if row["photo_path"]:
-                    async def send_photo(row=row, eligible=eligible):
+                        self.archive.db.execute("UPDATE notifications SET text_sent=1,text_offset=LENGTH(text) WHERE id=?", (row["id"],))
+                path = row["photo_path"]
+                if payload.get("kind") == "deleted" and len(payload.get("message_ids", [])) == 1:
+                    message = self.archive.get(owner, payload["chat_id"], payload["message_ids"][0])
+                    if message and message["photo_state"] in {"pending", "retry"}:
+                        with self.archive.db:
+                            self.archive.db.execute("UPDATE notifications SET retry_at=? WHERE id=?", (time.time() + 0.5, row["id"]))
+                        continue  # Deliver other users' notices while the photo is downloading.
+                    path = message["photo_path"] if message else None
+                    if message and message["photo_id"] and message["photo_state"] == "failed":
+                        await self.telegram(lambda row=row: self.bot.send_message(
+                            row["chat_id"], "Фотографию не удалось скачать. Сохранённый текст остался в переписке."))
+                if path:
+                    async def send_photo(path=path, row=row, eligible=eligible):
                         if not eligible():
                             raise ValueError("Notification paused or erased")
-                        if Path(row["photo_path"]).is_file():
-                            return await self.bot.send_photo(
-                                row["chat_id"], FSInputFile(row["photo_path"]))
-                        return await self.bot.send_message(
-                            row["chat_id"], "⚠️ Фотография отсутствует на сервере.")
+                        if Path(path).is_file():
+                            return await self.bot.send_photo(row["chat_id"], FSInputFile(path))
+                        return await self.bot.send_message(row["chat_id"], "Фото недоступно. Сохранённый текст остался в переписке.")
                     await self.telegram(send_photo)
                 with self.archive.db:
                     self.archive.db.execute("UPDATE notifications SET delivered=1 WHERE id=?", (row["id"],))
             except TelegramForbiddenError:
-                self.archive.pause_user(row["owner_id"])
-                await self.stop_tasks(row["owner_id"])
+                self.archive.pause_user(owner)
+                await self.stop_tasks(owner, all_jobs=True)
             except Exception as exc:
                 LOG.warning("Notification delayed: %s", type(exc).__name__)
                 with self.archive.db:
-                    self.archive.db.execute("UPDATE notifications SET retry_at=? WHERE id=?",
-                                            (time.time() + 60, row["id"]))
+                    self.archive.db.execute("UPDATE notifications SET retry_at=? WHERE id=?", (time.time() + 10, row["id"]))
 
     async def notifications(self):
         while True:
+            self.wakeup.clear()
             try:
                 await self.deliver_notifications()
+                await asyncio.wait_for(self.wakeup.wait(), timeout=0.3)
+            except TimeoutError:
+                pass
             except Exception as exc:
                 LOG.error("Notification worker: %s", type(exc).__name__)
-            await asyncio.sleep(1)
+                await asyncio.sleep(1)
+
+    async def maintain_once(self):
+        for row in self.archive.pending_deletions():
+            self._schedule_mute(row)
+        for row in self.archive.pending_photos():
+            self._schedule_media(row)
+
+    async def maintenance(self):
+        while True:
+            try:
+                await self.maintain_once()
+            except Exception as exc:
+                LOG.error("Archive worker: %s", type(exc).__name__)
+            await asyncio.sleep(0.3)
 
     def guarded(self, handler):
         async def wrapped(event):
@@ -720,7 +809,6 @@ class Veltrix:
             try:
                 await handler(event)
             except Exception as exc:
-                # Exception strings may contain URLs/tokens or message contents.
                 LOG.error("%s failed: %s", handler.__name__, type(exc).__name__)
             finally:
                 self.handler_tasks.discard(task)
@@ -728,6 +816,7 @@ class Veltrix:
 
     def register(self, dispatcher):
         dispatcher.message.register(self.guarded(self.private))
+        dispatcher.callback_query.register(self.guarded(self.callback))
         dispatcher.business_connection.register(self.guarded(self.connected))
         dispatcher.business_message.register(self.guarded(self.business_message))
         dispatcher.edited_business_message.register(self.guarded(self.edited))
@@ -735,28 +824,22 @@ class Veltrix:
 
     async def close(self):
         self.closing = True
+        workers = [task for task in (self.notification_task, self.maintenance_task) if task]
+        for task in workers:
+            task.cancel()
         handlers = list(self.handler_tasks)
         for task in handlers:
             task.cancel()
-        await asyncio.gather(*handlers, return_exceptions=True)
-        await self.stop_tasks()
-        if self.notification_task:
-            self.notification_task.cancel()
-            await asyncio.gather(self.notification_task, return_exceptions=True)
+        await asyncio.gather(*workers, *handlers, return_exceptions=True)
+        await self.stop_tasks(all_jobs=True)
 
 
 def configuration():
     load_dotenv(ROOT / ".env")
     token = os.environ.get("BOT_TOKEN", "").strip()
-    try:
-        delay = float(os.environ.get("SPAM_DELAY", "1.5"))
-        if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{20,}", token):
-            raise ValueError
-        if not math.isfinite(delay) or delay < 1:
-            raise ValueError
-    except ValueError as exc:
-        raise ValueError("Укажите настоящий BOT_TOKEN в .env; SPAM_DELAY должен быть числом >= 1.") from exc
-    return token, delay
+    if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{20,}", token):
+        raise ValueError("Укажите настоящий BOT_TOKEN в локальном .env.")
+    return token, Veltrix.parse_delay(os.environ.get("SPAM_DELAY", "0.1"))
 
 
 async def main():
@@ -769,18 +852,20 @@ async def main():
     try:
         while True:
             try:
-                me = await app.telegram(bot.get_me)
-                await app.telegram(lambda: bot.delete_webhook(drop_pending_updates=False))
+                me = await app.telegram(bot.get_me, lane="control")
+                await app.telegram(lambda: bot.delete_webhook(drop_pending_updates=False), lane="control")
                 break
             except TelegramNetworkError:
                 LOG.warning("Telegram unavailable at startup; retrying in 3 seconds")
                 await asyncio.sleep(3)
+        app.username = me.username or ""
         if not me.can_connect_to_business:
-            print("Внимание: включите Secretary Mode / Business Mode у бота в @BotFather.")
+            print("Включите Secretary Mode / Business Mode у бота в @BotFather.")
         app.notification_task = asyncio.create_task(app.notifications())
-        print(f"Veltrix запущен: @{me.username}. Остановка: Ctrl+C.")
+        app.maintenance_task = asyncio.create_task(app.maintenance())
+        print(f"Veltrix запущен: @{app.username}. Остановка: Ctrl+C.")
         await dispatcher.start_polling(bot, allowed_updates=[
-            "message", "business_connection", "business_message",
+            "message", "callback_query", "business_connection", "business_message",
             "edited_business_message", "deleted_business_messages",
         ], close_bot_session=False)
     finally:
